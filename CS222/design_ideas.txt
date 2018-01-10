@@ -1,0 +1,332 @@
+Developers Information:
+#1 Developer Name : Lingxi Meng
+#2 Developer Name : Di Wu
+OS (bit) : 64-bit Ubuntu (Linux) / macOS 10.12.6(64bit)
+gcc version : (Ubuntu 6.3.0-12ubuntu2) 6.3.0 20170406
+
+
+*****************************************************************************************
+Section 1. Paged-file Manager Class and record-based file Manager (pfm and rbfm folders)
+*****************************************************************************************
+1.1 Internal Record Format
+The record bit representation format is:
+
+					   --------------------------------------------------------------------------------------------------
+					   |2 bytes|2 bytes|2 bytes|...|2 bytes| Attribute 1 Data | Attribute 2 Data |...| Attribute N Data |      	
+					   --------------------------------------------------------------------------------------------------
+					   
+					   |---- N Short Int Type Pointers ----|----------------- N Attribute Information ------------------|
+
+At the beginning of each record, there are N pointers. Every pointer is short int type and record the offset information of each attribute in the whole record.
+The pointer points to the head of each attribute, which means each 2-byte slot records the relstive position number of each attribute, i.e., the offset to the head of the record.
+For example, the first attibute information starts at the 50th byte (50 byte offset to the head of the record), then the first pointer storage number 50 as the short int type.
+The length of each attribute data is gained by the difference of its next adjacent non-NULL pointer values and its pointer values. 
+If the second pointer value is 60, then it means the first attribute information has 10 bytes.
+
+To storage NULL attribute information, I use -1 as the corresponding attribute pointer value. 
+The NULL attribute information will be skipped (NULL information) in the attribute data section, but won`t be skipped at the pointer section.
+So if there are totally N attributes, and M of them are NULL, then the record will still have N pointers at the head section, and (N-M) attribute information in the attribute data section.
+
+To access a certain attribute, just read its pointer value p1 and its next non-NULL pointer value p2, and then read the record data block start from offset p1 and has length (p2-p1).
+If all the attribute information after this wanted attribute are NULL, then p2 is the end of the whole record, which could be calculated based on the given RID.
+Thus, this bit representation format satisfies O(1)field access.
+
+To storage a VarChar field, just storage the VarChar field itself into the record, and storage its inner head offset value into its pointer. The length of the varChar field is gained by p2-p1. 
+
+
+1.2 Page Format
+- Show your page format design
+                                                                ---------------------> record are inserted accordingly
+							       ---------------------------------------------------------------
+							       |          |          |                                       |
+							       | record 1 | record 2 | ... ...                               |
+							       |          |          |                                       |
+							       |-------------------------------------------------------------|
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                           ......                            |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                        slots are inserted reversely         |
+							       |                 <------------------------------------------ |
+							       |                 ____________________________________________|
+							       |                |        |        |        |        |        |
+							       |                |  ....  | Slot # | Length |   N    |   F    |
+							       |                |        |        |        |        |        |
+							       ---------------------------------------------------------------
+              
+                                                                                         |---- Slot 0 -----|
+                                                                                |---------------- Directory -----------------|
+
+Each page contains record data and directory. The right-most directory information is marked as "F" above, which is the flag, recording the free space in bytes of this page.
+The next value in the directory is "N", which is the number of the slots. Both "F" and "N" are 2 bytes, storaged in short int type.
+Then, from the left-most bit of "N" block, the other left slots in the directory are slots for records. Each record slots are 4 bytes, containing 2 components: slot number and record length.
+They are also short int type. The slot number records the offset value of the head of each record inside this page, which is the offset byte within this page (i.e., 0 <= offset < 4096).
+
+The record are storaged one by one without empty bytes in between, and their slots are storaged reversely from the end to the head of the page.
+Both the slot number and the page number are from 0 instead of 1.
+
+
+1.3 Create File:
+When a new file is created, a "virtual first page" is also established into the file, which is not a data page. The page records a "signature" and the three counters of read, write and append.
+The signature is used to recognise whether a file is created by calling the PagedFileManager::createFile() method. 
+If there is no this signature, then this file could not be destroyed, open or close by calling the methods in the PagedFileManager class.
+
+
+1.4 Insert Record
+When inserting a new record, the method first convert the record format from given to the format above. 
+Then this method will check whether there is enough free space at the existed last page for both the whole record and its 4-byte slot. 
+If yes, then this record will be insert accordingly as well as its slot. Also, this method will update the value of "N" and "F" in the directory.
+But if no, this method will travel all the other existed pages to find whether there is one page could storage this record. 
+If found, then insert it and update its RID, but if all the pages have no enough free space, then this method will append a new page and insert the record at that page.
+The directory of each page is also constructed at this time.
+
+
+1.5 Read Record
+This method will first find the record in the database according to the given RID. If the RID is invalid, then it will return -1.
+If the correct record is found, then this method will convert this record format into the previous format and storage it into the given memory.
+
+
+1.6 Update and Delete Record
+When delete the record, the whole record will be removed from the file, and the later records will be moved forward to fill in the place of the deleted record.
+When update the record, the whole record will be replaced by the updated one. The later records will be moved forward or backward depends on the length of the new record.
+If the new record is too long to fit the current page, then it will generate an 8-byte "tombstone" at the old record place, which including a 2-byte flag that indicates this
+is a tombstone, a 4-byte new page number and a 2-byte new slot number. This tombstone is actually a pointer that points to the new record insertion place.
+
+
+
+**************************************************************
+Section 2. Catalog Design: Relation Manager Class (rm folder)
+**************************************************************
+2.1 Meta-data Design (Tables and Columns table) and information about each column.
+The file Tables records all the record files information, including itself. 
+Each record in the file "Tables" has three attributes: table-id (INT type), table-name (VARCHAR type), and file-name (VARCHAR type).
+The file Columns records all the attributes information of each file, including itself. 
+Each record in the file "Columns" has five attributes: table-id (INT type), column-name (VARCHAR type), column-type (INT type), column-length (INT type), column-position (INT type).
+Here, the value of table-id starts from 1, and will increase every time a new table is created. 
+So when a new catalog is created, the records with table-name "Tables" has id = 1; the records with table-name "Columns" has id = 2.
+The records stored in Tables and Columns follow the format that is shown in the next section.
+
+
+2.2 File Format
+In this project, each file contents the whole information of a table. To make it convenient, the table name is always the same with the file name. In particular, the two catalog files are named "Tables" and "Columns", which is by default and not changeable.
+
+The first page is a "virtual first page". The page includes a signature string "sign", the three counters of the read page, write page and append page. The signature is used for judege whether this 
+file is a database file, thus whether this file could be modified. If this file is a catalog file (the fileName is "Tables" or "Columns"), then there is another integer written in this page, which 
+is the table id. This id as well as the other three counters are written into the file when the file is closed, and will be read out of the disk to modify when the file is open.
+
+The other parts of the file is one page by one page. Each page is 4096 bytes. For example, just after a catalog is created, the file "Tables" looks like this:
+
+							       ---------------------------------------------------------------
+							       |sign 0 0 0 1                                                 |
+							       |                             			             |  <-------- "Virtual first page"
+							       |                                                             |
+							       |-------------------------------------------------------------|
+							       |(1, "Tables", "Tables")(2, "Columns", "Columns")             |
+                                                               |                                                             |
+							       |                                                             |
+					                       |                                                             |  <-------- Page 0
+							       |                                                             |
+							       |                                                             |
+							       |                 ____________________________________________|
+							       |                |        |        |        |        |        |
+							       |                |  ....  | Slot # | Length |   N    |   F    |
+							       |                |        |        |        |        |        |
+							       ---------------------------------------------------------------
+ 		       					       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |  <--------- Other pages (will be appended as the records inserted)
+							       |                                                             |
+							       |                           ......                            |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+
+
+2.3 Catalog information about Index
+- Show your catalog information about an index (tables, columns). 
+In Relation manager, we encapsulate the functions of index manager, and let the relation manager handles both record based heap file and B+ tree file, and keep the index file synchronous with record based file. In order to handle it, we first register each index file in 'Tables' table every time creating a index based file in the following format.
+					   -------------------------------------------------------------
+					   |    id    |     indexTablesName     |    indexFilesName    |     	
+					   -------------------------------------------------------------
+The indexFilesName is composed in this format : TableName_AttributeName.idx
+And there is no registration in "Columns" table.
+
+
+
+****************************************************************
+Section 3. B+ Tree Index Design: Index Manager Class (ix folder)
+****************************************************************
+3.1 Meta-data page in an index file
+The index files saved the index information over the unordered data records stored in the heap file. Just like normal data file, it contains a default page which is used to store three counters and the signature of index file.
+The index file contains two kinds of Node in the B+ tree (leaf node and non-leaf node): 
+Both of them contains a header in page 0 : leafIndicator ('0' for non-leaf, '1' for leaf)(1 byte), numberOfEntry (2 byte), left space (2 byte)
+Non-leaf node has three components : index key (4 byte for Int/Real, various byte for varchar), pointer (4 byte page number which points to the lowerLayer node), and a directory for varchar (left offset which points to the end relative offset of each entry)
+Leaf node has four components : data key which stored in one of records in heap file (4 byte for Int/Real, various byte for varchar), RID (8 byte, 4byte for page number and 4 byte for slot number) which indicate the physical position of each record stored in heap file.
+
+
+3.2 Index Entry Format
+For non-leaf node, it has pointers and key. Pointers are actually page numbers of leaf nodes, they point to those leaves who are bigger (right pointer) or smaller (left pointer) than its keys.
+Its structure is below. The length of key is determined by Attribute type : 4 byte for int / real, various length for varchar.
+
+					   -------------------------------------------------
+					   |    4 bytes    |      key      |    4 bytes    |     	
+					   -------------------------------------------------
+					   
+					   |- page number -|------key------|- page number -|
+
+
+As for the leaf node, it has a key and its RID which is a physical attribute of one record stored in the heap file.
+
+					           ---------------------------------
+					           |      key      |    4 bytes    |     	
+					           ---------------------------------
+					   
+					           |------key------|------RID------|
+
+
+3.3 Page Format
+The internal-page (non-leaf node) design is:
+
+
+                                                                                      ---------------------> record are inserted accordingly
+							       ---------------------------------------------------------------
+							       |                     |          |          |                 |
+							       |     Header          | PageNum1 |   Key 1  |   PageNum2      |
+							       |                     |          |          |                 |
+							       |-------------------------------------------------------------|
+							       |                                  |                          |
+							       |       ......           ......    |                          |
+							       |                                  |                          |
+							       |----------------------------------                           |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                           ......                            |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                        offsets are inserted reversely       |
+							       |                 <-------------------------------------------|
+							       |                 ____________________________________________|
+							       |                |        |        |        |        |        |
+							       |                |  ....  |offset 3|offset 2|offset 1| offset0|
+							       |                |        |        |        |        |        |
+							       ---------------------------------------------------------------
+              
+                                                                                        
+                                                                                |----------------- Directory ----------------|
+
+Each Non-leaf page contains a header in the beginning, which is 5 byte totally and 1 byte for leaf indicator(char type, '0' for non-leaf page), 2 byte for number of node in this page, 2 byte for the free space left.
+Then non-leaf nodes are adjacent to the header, which have n keys and (n + 1) page numbers. For varchar, there is a directory which contains the end position (offset) of each node in the end of non-leaf node. It goes in opposite direction so that the free space in the non-leaf page is always in the middle.
+
+The leaf-page (leaf node) design is:
+
+
+
+                                                                                      ---------------------> record are inserted accordingly
+							       ---------------------------------------------------------------
+							       |                     |          |          |        |        |
+							       |     Header          |   Key1   |    RID1  |   Key2 |  RID2  |
+							       |                     |          |          |        |        |
+							       |-------------------------------------------------------------|
+							       |                                  |                          |
+							       |       ......           ......    |                          |
+							       |                                  |                          |
+							       |----------------------------------                           |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                           ......                            |
+							       |                                                             |
+							       |                                                             |
+							       |                                                             |
+							       |                        offsets are inserted reversely       |
+							       |                 <----------------------------------         |
+							       |                 ____________________________________________|
+							       |                |        |        |        |        |        |
+							       |                |  ....  |offset 2|offset 1|offset 0|NextPage|
+							       |                |        |        |        |        |        |
+							       ---------------------------------------------------------------
+              
+                                                                                        
+                                                                                |----------------- Directory -------|
+
+In the leaf page, it also has a header in the beginning of each node (page), which is 5 byte. But the leaf indicator in header is '1' (char) to indicate this page is a leaf page.
+Then the leaf nodes are adjacent to the header, which has many (key, RID) pairs to label a physical record in the heap file. The length of keys is variable and determined by the type of node (4 byte for INT/Real type and various length for varchar type), and RID length is 8 byte (4 byte for pageNum, 4 byte for slotNum).
+In the end of leaf page there is a int page number (4 byte) who points to the next leaf page which is adjacent in the bottom of B+ tree. And similarly, there is a offset directory which contains the ending offset of each (Key, RID) pair.
+
+
+3.3 Implementation Details
+As the height of B+ tree is not high (never bigger than 3 layers), the print B tree function is recursively implemented. In this implementation, it is useful to add another helper function to help print B+ tree using BFS (Breath First Search). Because the parameters of printBtree are only ixfileHandle and attribute, we add another function who has ixfileHandle, type, root num, current page content these four parameter in order to use them in every state of recursive printing. 
+There are several points needed to take care: 
+1) The printing of leaf and non-leaf is different, leaf doesn't have children.
+--different situation handling
+2) The end of each printing component doesn't have ','.
+--print the first one in the beginning, then print "," + left one iteratively.
+3) If leaf entries contain duplicate values, there's no duplicate key printing anymore, and the RID of it should be in the same quotation marks of former one's.
+--remember the former keys when handling leaves, and forget them in the suitable time.
+
+
+
+**********************************************************
+Section 4. Query Engine Design: Other Classes (qe folder)
+**********************************************************
+This part mainly implements the basic SQL commands, including SELECT, PROJECT, JOIN, AGGREGATE, etc, by giving different instances of iterator (abstract) class.
+
+4.1 Block Nested Loop Join (If you have implemented this feature)
+Given a buffer size, i.e. block capacity (number of pages * page size), we use a while loop to retrieve records from left table until the records fill all buffer. And we build a hash map through buffer' all records. After that, we retrieve records from right table one by one to do a look up in this hash map. Once joining the right record, we put it into the output buffer (1 page, 4096 bytes). And when buffer is full, we flush the whole output buffer into disk and prepare for further join. Through this line, we retrieve buffer size byte each time retrieving left table.
+
+                                                      number of pages * page size byte
+					   -------------------------------------------------------------
+					   |                                                           | 
+                                           |  retrieve until buffer is full                            | 
+                leftTable ---------------------------------->                                          | 
+                                           |                                                           |                   |---------------------------| flush to disk
+                                           |                build a in memory hash map                 | 		   |         		   --------------------->
+                                           |                                                           |   join		   |	output buffer          |
+                                           |                                                           |-----------------------> 		       |
+					   |                                                           |                   ----------------------------- 	
+					   -------------------------------------------------------------
+					        /\
+						|
+						|
+						| do a look up each record
+						|
+						|
+				            rightTable
+
+4.2 Index Nested Loop Join
+We loop through left index file to get each attribute value, and for each attribute, we try to match it in the right index file.
+Once matching, we put it into data for printing.
+
+
+4.3 Grace Hash Join
+First of all, partition phrase. We malloc an input buffer (number of partitions * PAGE_SIZE) (buildHash function). For R or S table, we retrieve each record into the input buffer's matched page using a self-defined hash function. Eg. if a record's hash number is k, we put it into k'th page in the input buffer. If one page in the input buffer is full, we write the whole page into a partition file. Until exhausting both R and S tables, we get a two batches of partition files (each file's records have the same hashcode).
+Secondly, build phrase. We use buildhash function to retrieve records from R table's partition files and build a in-memory hash map. 
+Thirdly, probe phrase. After building hash map, we read records from S table's partition file one by one, and use a lookUpHash function to match each record in S's partition file. Every time matching, we put the record into a output vector (in outputRes function).
+
+
+4.4 Aggregation
+- Describe how your aggregation (basic, group-based hash) works.
+For basic:
+First use different function to handle different AggregateOp(min, max, count, sum, average). For instance, we consistently get the next tuple using input iterator acquired in constructor until exhausted. And each time we refresh our min value. Finally, we write the min value and its former null indicator in data to return. Similar implementation way for other four functions.
+
+For group-based hash:
+We use a map structure to store the fresh information : key is the value of left attribute, and value is the fresh target value of the right attribute. We implement different functions in order to call in getNextTuple function for different AggregateOp.
+For example, in group sum function, we refresh the pair(for old key) or insert pair(for new key) when getting tuple in input iterator in while loop.
+The map structure is like this format: <valueInLeafKey, currentCount(rightKey)>
+
+
+4.5 Implementation Detail
+- Have you implemented any optional features? Then, describe them here.
+Yes. We implemented optional aggregate and Grace Hash Join. 
+For optional aggregate, we use three different map (<int, float>, <float, float> and <string, float>) and vector to build the key-value pair for each getNextTuple in the input iterator. And fresh the map each time acquiring a new record. For example, if aggregateOp is MAX, we add a getGroupMax function to do it. Each time getting a record, we find if the value of aggAttr exists in map: if not we put the new pair into map; if exist, we compare the value of gAttr to fresh the max value. After loop through the getNextTuple in input iterator, we finally get the banch max value.for each value of aggAttr.
+For GHJ, we implemented it through the way of professor's lecture. There are three step: partition phrase (partition R and S tables into small partition file using a self-defined function), build phrase (build a in-memory hash table with given size),probe phrase (loop through S table one by one, flushing into output buffer once matching). The further details of GHJ can be found in section 4.3.
